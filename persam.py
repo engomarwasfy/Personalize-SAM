@@ -24,6 +24,9 @@ from tqdm import tqdm
 import argparse
 import matplotlib.pyplot as plt
 import warnings
+from skimage.morphology import binary_opening, binary_closing, remove_small_objects, disk
+from scipy.ndimage import binary_fill_holes
+from skimage.measure import label
 warnings.filterwarnings('ignore')
 
 from show import *
@@ -46,12 +49,27 @@ def get_arguments():
     parser.add_argument('--sam_type', type=str, default='vit_h')
     parser.add_argument('--topk', type=int, default=1, help='Number of top-k points for location prior')
     parser.add_argument('--feat_aggregation', type=str, default='mean_max', 
-                        choices=['mean', 'max', 'mean_max'], 
-                        help='Feature aggregation method: mean, max, or mean_max combination')
+                        choices=['mean', 'max', 'mean_max', 'multi_scale'], 
+                        help='Feature aggregation method')
     parser.add_argument('--sim_threshold', type=float, default=None, 
                         help='Similarity threshold for filtering (None for auto)')
     parser.add_argument('--box_padding', type=float, default=0.05, 
-                        help='Padding ratio for bounding box expansion (0.05 = 5%%)')
+                        help='Padding ratio for bounding box expansion')
+    parser.add_argument('--adaptive_threshold', dest='adaptive_threshold', action='store_true')
+    parser.add_argument('--no_adaptive_threshold', dest='adaptive_threshold', action='store_false')
+    parser.set_defaults(adaptive_threshold=True)
+    parser.add_argument('--morphological_cleanup', dest='morphological_cleanup', action='store_true')
+    parser.add_argument('--no_morphological_cleanup', dest='morphological_cleanup', action='store_false')
+    parser.set_defaults(morphological_cleanup=True)
+    parser.add_argument('--ensemble_points', dest='ensemble_points', action='store_true')
+    parser.add_argument('--no_ensemble_points', dest='ensemble_points', action='store_false')
+    parser.set_defaults(ensemble_points=True)
+    parser.add_argument('--min_point_distance', type=float, default=0.10)
+    parser.add_argument('--confidence_threshold', type=float, default=0.5)
+    parser.add_argument('--min_area_ratio', type=float, default=0.001)
+    parser.add_argument('--tta', dest='tta', action='store_true')
+    parser.add_argument('--no_tta', dest='tta', action='store_false')
+    parser.set_defaults(tta=False)
     
     args = parser.parse_args()
     return args
@@ -165,6 +183,17 @@ def persam(args, obj_name, images_path, masks_path, output_path):
         target_feat_mean = target_feat.mean(0)
         target_feat_max = torch.max(target_feat, dim=0)[0]
         target_embedding = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
+    elif args.feat_aggregation == 'multi_scale':
+        target_feat_mean = target_feat.mean(0)
+        target_feat_max = torch.max(target_feat, dim=0)[0]
+        target_feat_median = torch.median(target_feat, dim=0)[0]
+        target_feat_min = torch.min(target_feat, dim=0)[0]
+        target_embedding = (
+            0.4 * target_feat_mean
+            + 0.35 * target_feat_max
+            + 0.15 * target_feat_median
+            + 0.10 * target_feat_min
+        ).unsqueeze(0)
     else:
         target_embedding = target_feat.mean(0).unsqueeze(0)
     
@@ -205,23 +234,46 @@ def persam(args, obj_name, images_path, masks_path, output_path):
                         input_size=predictor.input_size,
                         original_size=predictor.original_size).squeeze()
 
-        # Apply similarity threshold if specified
-        if args.sim_threshold is not None:
-            sim = torch.clamp(sim, min=args.sim_threshold)
+        if args.tta:
+            sim_orig = sim
+            test_image_flip = np.ascontiguousarray(test_image[:, ::-1, :])
+            predictor.set_image(test_image_flip)
+            test_feat_f = predictor.features.squeeze()
+            C2, h2, w2 = test_feat_f.shape
+            test_feat_f = test_feat_f / (test_feat_f.norm(dim=0, keepdim=True) + 1e-8)
+            test_feat_f_flat = test_feat_f.reshape(C2, h2 * w2)
+            sim_f = target_feat @ test_feat_f_flat
+            sim_f = sim_f.reshape(1, 1, h2, w2)
+            sim_f = F.interpolate(sim_f, scale_factor=4, mode="bilinear", align_corners=False)
+            sim_f = predictor.model.postprocess_masks(
+                            sim_f,
+                            input_size=predictor.input_size,
+                            original_size=predictor.original_size).squeeze()
+            sim_f = torch.flip(sim_f, dims=[1])
+            sim = (sim_orig + sim_f) / 2.0
+            predictor.set_image(test_image)
 
-        # Enhanced point selection with configurable top-k
-        topk_xy_i, topk_label_i, last_xy_i, last_label_i = point_selection(sim, topk=args.topk)
+        sim_mean = sim.mean()
+        sim_std = torch.std(sim) + 1e-8
+        if args.sim_threshold is not None:
+            thr = args.sim_threshold
+        elif args.adaptive_threshold:
+            thr = sim_mean - 0.5 * sim_std
+        else:
+            thr = None
+        if thr is not None:
+            sim = torch.clamp(sim, min=float(thr))
+
+        topk_xy_i, topk_label_i, last_xy_i, last_label_i = point_selection(
+            sim, topk=args.topk, ensemble=args.ensemble_points, min_dist=args.min_point_distance
+        )
         topk_xy = np.concatenate([topk_xy_i, last_xy_i], axis=0)
         topk_label = np.concatenate([topk_label_i, last_label_i], axis=0)
 
-        # Enhanced similarity normalization for attention
-        sim_mean = sim.mean()
-        sim_std = torch.std(sim) + 1e-8  # Add epsilon for stability
         sim_normalized = (sim - sim_mean) / sim_std
-        
-        # Better interpolation for attention map
-        sim_normalized = F.interpolate(sim_normalized.unsqueeze(0).unsqueeze(0), 
-                                       size=(64, 64), mode="bilinear", align_corners=False)
+        sim_normalized = F.interpolate(
+            sim_normalized.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="bilinear", align_corners=False
+        )
         attn_sim = sim_normalized.sigmoid_().unsqueeze(0).flatten(3)
 
         # First-step prediction with target guidance
@@ -272,19 +324,43 @@ def persam(args, obj_name, images_path, masks_path, output_path):
 
         # Save results
         if masks is not None and masks.shape[0] > 0:
-            # Save visualization
+            sel_idx = int(best_idx)
+            Hs, Ws = sim.shape
+            sim_np = sim.detach().cpu().numpy()
+            min_area_pixels = max(1, int(args.min_area_ratio * Hs * Ws))
+            best_quality = -1e9
+            any_pass = False
+            for i in range(masks.shape[0]):
+                mi = masks[i].astype(bool)
+                area = int(mi.sum())
+                if area < min_area_pixels:
+                    continue
+                sc = float(scores[i])
+                if sc < float(args.confidence_threshold):
+                    continue
+                any_pass = True
+                mean_sim = float(sim_np[mi].mean()) if area > 0 else 0.0
+                q = sc + 0.3 * mean_sim
+                if q > best_quality:
+                    best_quality = q
+                    sel_idx = i
+            if not any_pass:
+                sel_idx = int(np.argmax(scores))
+
+            final_mask = masks[sel_idx].astype(bool)
+            if args.morphological_cleanup:
+                final_mask = refine_mask_morphological(final_mask, min_area_pixels)
+
             plt.figure(figsize=(10, 10))
             plt.imshow(test_image)
-            show_mask(masks[best_idx], plt.gca())
+            show_mask(final_mask, plt.gca())
             show_points(topk_xy, topk_label, plt.gca())
-            plt.title(f"Mask {best_idx} (Score: {scores[best_idx]:.3f})", fontsize=18)
+            plt.title(f"Mask {sel_idx} (Score: {scores[sel_idx]:.3f})", fontsize=18)
             plt.axis('off')
             vis_mask_output_path = os.path.join(output_path, f'vis_mask_{test_idx}.jpg')
             plt.savefig(vis_mask_output_path, bbox_inches='tight', pad_inches=0, dpi=100)
             plt.close()
 
-            # Save mask
-            final_mask = masks[best_idx]
             mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
             mask_colors[final_mask, :] = np.array([[0, 0, 128]])
             mask_output_path = os.path.join(output_path, test_idx + '.png')
@@ -297,7 +373,24 @@ def persam(args, obj_name, images_path, masks_path, output_path):
             torch.cuda.empty_cache()
 
 
-def point_selection(mask_sim, topk=1):
+def refine_mask_morphological(mask, min_area_pixels):
+    h, w = mask.shape
+    r_close = max(1, int(0.01 * min(h, w)))
+    r_open = max(1, int(0.005 * min(h, w)))
+    m = mask.astype(bool)
+    m = binary_closing(m, disk(r_close))
+    m = binary_opening(m, disk(r_open))
+    m = binary_fill_holes(m)
+    m = remove_small_objects(m, min_size=max(1, int(min_area_pixels)))
+    lab = label(m.astype(np.uint8))
+    if lab.max() > 0:
+        sizes = np.bincount(lab.ravel())[1:]
+        if sizes.size > 0:
+            max_label = sizes.argmax() + 1
+            m = (lab == max_label)
+    return m.astype(bool)
+
+def point_selection(mask_sim, topk=1, ensemble=False, min_dist=0.1):
     """
     Enhanced point selection with better handling of edge cases.
     Training-free inference method - no learnable parameters.
@@ -312,47 +405,73 @@ def point_selection(mask_sim, topk=1):
         last_xy: Negative point coordinates (topk, 2) in (x, y) format
         last_label: Negative point labels (topk,)
     """
-    # Ensure mask_sim is a tensor and on the same device
     if not isinstance(mask_sim, torch.Tensor):
         mask_sim = torch.tensor(mask_sim)
-    
-    # Get dimensions (height, width)
-    w, h = mask_sim.shape  # Note: shape is (W, H) from postprocess_masks output
-    
-    # Flatten the similarity map
+    w, h = mask_sim.shape
     mask_flat = mask_sim.flatten(0)
-    
-    # Adjust topk if necessary
     num_pixels = mask_flat.numel()
-    if num_pixels < topk:
-        topk = max(1, num_pixels)  # At least 1 point
-    
-    # Get top-k positive points (highest similarity) - matching original logic
-    if topk > 0 and num_pixels > 0:
-        topk_xy = mask_flat.topk(topk)[1]
-        topk_x = (topk_xy // h).unsqueeze(0)
-        topk_y = (topk_xy - topk_x * h)
-        topk_xy = torch.cat((topk_y, topk_x), dim=0).permute(1, 0)
-        topk_label = np.array([1] * topk)
-        topk_xy = topk_xy.cpu().numpy()
-    else:
-        # Fallback to center point if no valid points
-        topk_xy = np.array([[h // 2, w // 2]])
-        topk_label = np.array([1])
-        
-    # Get top-k negative points (lowest similarity)
-    if topk > 0 and num_pixels > topk:
-        last_xy = mask_flat.topk(topk, largest=False)[1]
-        last_x = (last_xy // h).unsqueeze(0)
-        last_y = (last_xy - last_x * h)
-        last_xy = torch.cat((last_y, last_x), dim=0).permute(1, 0)
-        last_label = np.array([0] * topk)
-        last_xy = last_xy.cpu().numpy()
-    else:
-        # Fallback to corner points if needed
-        last_xy = np.array([[0, 0], [h-1, w-1]])[:topk]
-        last_label = np.array([0] * last_xy.shape[0])
-    
+    if num_pixels <= 0:
+        return np.array([[h // 2, w // 2]]), np.array([1]), np.array([[0, 0]]), np.array([0])
+    topk = max(1, min(int(topk), int(num_pixels)))
+
+    k_candidates = int(min(3000, int(num_pixels)))
+    vals, idxs = mask_flat.topk(k_candidates)
+    pos_coords = []
+    min_px = max(1.0, min(w, h) * float(min_dist))
+    for idx in idxs:
+        x = (idx // h).item()
+        y = (idx - x * h).item()
+        if not ensemble:
+            pos_coords.append([y, x])
+            if len(pos_coords) >= topk:
+                break
+        else:
+            if len(pos_coords) == 0:
+                pos_coords.append([y, x])
+            else:
+                ok = True
+                for (py, px) in pos_coords:
+                    if ((py - y) ** 2 + (px - x) ** 2) ** 0.5 < min_px:
+                        ok = False
+                        break
+                if ok:
+                    pos_coords.append([y, x])
+            if len(pos_coords) >= topk:
+                break
+    if len(pos_coords) < topk:
+        need = topk - len(pos_coords)
+        for idx in idxs[len(pos_coords): len(pos_coords) + need]:
+            x = (idx // h).item()
+            y = (idx - x * h).item()
+            pos_coords.append([y, x])
+            if len(pos_coords) >= topk:
+                break
+    topk_xy = np.array(pos_coords, dtype=np.int64)
+    topk_label = np.ones((topk_xy.shape[0],), dtype=np.int64)
+
+    k_candidates_n = int(min(3000, int(num_pixels)))
+    _, idxs_n = mask_flat.topk(k_candidates_n, largest=False)
+    neg_coords = []
+    for idx in idxs_n:
+        x = (idx // h).item()
+        y = (idx - x * h).item()
+        far = True
+        for (py, px) in topk_xy:
+            if ((py - y) ** 2 + (px - x) ** 2) ** 0.5 < min_px:
+                far = False
+                break
+        if far:
+            neg_coords.append([y, x])
+        if len(neg_coords) >= topk:
+            break
+    if len(neg_coords) < topk:
+        corners = [[0, 0], [h - 1, 0], [0, w - 1], [h - 1, w - 1]]
+        for c in corners:
+            neg_coords.append(c)
+            if len(neg_coords) >= topk:
+                break
+    last_xy = np.array(neg_coords[:topk], dtype=np.int64)
+    last_label = np.zeros((last_xy.shape[0],), dtype=np.int64)
     return topk_xy, topk_label, last_xy, last_label
     
 
