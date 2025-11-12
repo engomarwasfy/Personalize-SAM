@@ -28,11 +28,87 @@ warnings.filterwarnings('ignore')
 
 from show import *
 from per_segment_anything import sam_model_registry, SamPredictor
-
+from dinov3_encoder import DinoV3FeatureExtractor
 
 # Global SAM instance to avoid reloading for each object
 sam = None
 predictor = None
+dinov3_extractor = None
+
+
+def _resize_mask_for_features(mask_tensor, spatial_hw):
+    """Resize the reference mask to match a feature map spatial size."""
+    resized = F.interpolate(
+        mask_tensor, size=spatial_hw, mode="bilinear", align_corners=False
+    )
+    resized = resized.squeeze()
+    if resized.dim() == 3:
+        resized = resized[0]
+    return resized
+
+
+def _aggregate_target_vector(feat_map, mask, method="mean_max"):
+    """Aggregate masked features into a single target vector."""
+    if mask.numel() == 0:
+        return None
+    mask_bool = mask > 0
+    mask_pixels = feat_map[mask_bool]
+    if mask_pixels.shape[0] == 0:
+        return None
+
+    if method == "mean":
+        return mask_pixels.mean(0)
+    if method == "max":
+        return torch.max(mask_pixels, dim=0)[0]
+    if method == "mean_max":
+        feat_mean = mask_pixels.mean(0)
+        feat_max = torch.max(mask_pixels, dim=0)[0]
+        return 0.5 * feat_mean + 0.5 * feat_max
+
+    return mask_pixels.mean(0)
+
+
+def _normalize_vector(vec, eps=1e-6):
+    """Normalize the last dimension of a tensor."""
+    denom = vec.norm(dim=-1, keepdim=True).clamp(min=eps)
+    return vec / denom
+
+
+def _compute_similarity(target_feat, feat_map):
+    """Compute cosine similarity map between a target vector and dense features."""
+    c, h, w = feat_map.shape
+    feat_norm = feat_map / (feat_map.norm(dim=0, keepdim=True) + 1e-8)
+    sim = target_feat @ feat_norm.reshape(c, h * w)
+    return sim.reshape(1, 1, h, w)
+
+
+def _prepare_mask_from_image(mask_image, size_hw, device):
+    """
+    Convert the raw RGB mask image into a float tensor aligned with a target resolution.
+    """
+    if mask_image.ndim == 3:
+        mask_gray = cv2.cvtColor(mask_image, cv2.COLOR_RGB2GRAY)
+    else:
+        mask_gray = mask_image
+    mask_tensor = torch.from_numpy(mask_gray.astype(np.float32) / 255.0).to(device)
+    mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+    mask_tensor = F.interpolate(mask_tensor, size=size_hw, mode="bilinear", align_corners=False)
+    mask_tensor = mask_tensor.squeeze()
+    return mask_tensor
+
+
+def _smooth_mask(mask_array, method='none', kernel=5, sigma=1.0):
+    """Apply simple post-processing to smooth binary masks."""
+    if method == 'none':
+        return mask_array.astype(bool)
+    kernel = max(1, kernel)
+    if kernel % 2 == 0:
+        kernel += 1
+    mask_float = mask_array.astype(np.float32)
+    if method == 'gaussian':
+        smoothed = cv2.GaussianBlur(mask_float, (kernel, kernel), sigma)
+        return smoothed > 0.5
+    return mask_array.astype(bool)
 
 
 def get_arguments():
@@ -52,6 +128,31 @@ def get_arguments():
                         help='Similarity threshold for filtering (None for auto)')
     parser.add_argument('--box_padding', type=float, default=0.05, 
                         help='Padding ratio for bounding box expansion (0.05 = 5%%)')
+    parser.add_argument('--feature_encoder', type=str, default='sam',
+                        choices=['sam', 'dinov3'],
+                        help='Backbone to compute similarity features.')
+    parser.add_argument('--dinov3_model_name', type=str, default=None,
+                        help='timm model name for DinoV3 encoder (required when feature_encoder=dinov3).')
+    parser.add_argument('--dinov3_image_size', type=int, default=518,
+                        help='Input size for DinoV3 image preprocessing.')
+    parser.add_argument('--dinov3_output_size', type=int, default=64,
+                        help='Spatial size to which DinoV3 features are upsampled (matches SAM by default).')
+    parser.add_argument('--dinov3_precision', type=str, default='fp32',
+                        choices=['fp32', 'fp16'],
+                        help='Computation precision for DinoV3 backbone.')
+    parser.add_argument('--dinov3_no_pretrained', action='store_true',
+                        help='Disable loading pretrained weights for DinoV3 model.')
+    parser.add_argument('--dinov3_sim_weight', type=float, default=0.5,
+                        help='Blend weight for DinoV3 similarity map (0 uses SAM only, 1 uses DinoV3 only).')
+    parser.add_argument('--dinov3_sim_gain', type=float, default=1.0,
+                        help='Optional scaling applied to the blended similarity map before downstream steps.')
+    parser.add_argument('--mask_smoothing', type=str, default='none',
+                        choices=['none', 'gaussian'],
+                        help='Post-processing to smooth the final binary mask for cleaner edges.')
+    parser.add_argument('--mask_smoothing_kernel', type=int, default=5,
+                        help='Kernel size (odd integer) for mask smoothing filters.')
+    parser.add_argument('--mask_smoothing_sigma', type=float, default=1.0,
+                        help='Sigma used by gaussian smoothing (if enabled).')
     
     args = parser.parse_args()
     return args
@@ -70,16 +171,15 @@ def main():
         os.mkdir('./outputs/')
     
     # Initialize global SAM instance
-    global sam, predictor
+    global sam, predictor, dinov3_extractor
     print("======> Load SAM (Global Instance)")
     if sam is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         if args.sam_type == 'vit_h':
             sam_type, sam_ckpt = 'vit_h', 'sam_vit_h_4b8939.pth'
-            device = "cuda" if torch.cuda.is_available() else "cpu"
             sam = sam_model_registry[sam_type](checkpoint=sam_ckpt).to(device=device)
         elif args.sam_type == 'vit_t':
             sam_type, sam_ckpt = 'vit_t', 'weights/mobile_sam.pt'
-            device = "cuda" if torch.cuda.is_available() else "cpu"
             sam = sam_model_registry[sam_type](checkpoint=sam_ckpt).to(device=device)
             sam.eval()
         else:
@@ -87,6 +187,22 @@ def main():
         sam.eval()
         predictor = SamPredictor(sam)
         print(f"======> SAM loaded on device: {device}")
+
+        if args.feature_encoder == 'dinov3':
+            if not args.dinov3_model_name:
+                raise ValueError("Please provide --dinov3_model_name when using DinoV3 encoder.")
+            if not (0.0 <= args.dinov3_sim_weight <= 1.0):
+                raise ValueError("--dinov3_sim_weight must be in [0, 1].")
+            precision = torch.float16 if args.dinov3_precision == 'fp16' else torch.float32
+            dinov3_extractor = DinoV3FeatureExtractor(
+                model_name=args.dinov3_model_name,
+                image_size=args.dinov3_image_size,
+                output_size=args.dinov3_output_size,
+                device=torch.device(device),
+                precision=precision,
+                pretrained=not args.dinov3_no_pretrained,
+            )
+            print(f"======> DinoV3 encoder loaded: {args.dinov3_model_name}")
     
     for obj_name in os.listdir(images_path):
         if ".DS" not in obj_name:
@@ -137,40 +253,35 @@ def persam(args, obj_name, images_path, masks_path, output_path):
     global predictor
     if predictor is None:
         raise RuntimeError("Predictor not initialized. Call main() first.")
+    feature_encoder = args.feature_encoder
 
     print("======> Obtain Location Prior" )
     # Image features encoding
-    ref_mask_tensor = predictor.set_image(ref_image, ref_mask)
-    ref_feat = predictor.features.squeeze().permute(1, 2, 0)
+    ref_mask_tensor = predictor.set_image(ref_image, ref_mask)  # stored for resizing
 
-    # Better interpolation with align_corners for consistent results
-    ref_mask_tensor = F.interpolate(ref_mask_tensor, size=ref_feat.shape[0: 2], 
-                                     mode="bilinear", align_corners=False)
-    ref_mask_tensor = ref_mask_tensor.squeeze()[0]
-
-    # Check if mask has valid pixels
-    mask_pixels = ref_feat[ref_mask_tensor > 0]
-    if mask_pixels.shape[0] == 0:
-        print(f"Warning: Reference mask is empty for {obj_name}")
+    sam_feat_map = predictor.features.squeeze().permute(1, 2, 0)
+    sam_mask = _resize_mask_for_features(ref_mask_tensor, sam_feat_map.shape[:2])
+    sam_target_vec = _aggregate_target_vector(sam_feat_map, sam_mask, args.feat_aggregation)
+    if sam_target_vec is None:
+        print(f"Warning: Reference mask is empty for {obj_name} (SAM features).")
         return
-
-    # Enhanced target feature extraction with configurable aggregation
-    target_feat = ref_feat[ref_mask_tensor > 0]
-    if args.feat_aggregation == 'mean':
-        target_embedding = target_feat.mean(0).unsqueeze(0)
-    elif args.feat_aggregation == 'max':
-        target_embedding = torch.max(target_feat, dim=0)[0].unsqueeze(0)
-    elif args.feat_aggregation == 'mean_max':
-        # Combine mean and max for better feature representation
-        target_feat_mean = target_feat.mean(0)
-        target_feat_max = torch.max(target_feat, dim=0)[0]
-        target_embedding = (target_feat_max / 2 + target_feat_mean / 2).unsqueeze(0)
+    sam_target_unit = _normalize_vector(sam_target_vec.unsqueeze(0))
+    sam_target_embedding = sam_target_vec.unsqueeze(0).unsqueeze(0)
+    dino_target_unit = None
+    if feature_encoder == 'dinov3':
+        dino_feat_map = dinov3_extractor(ref_image).permute(1, 2, 0)
+        dino_mask = _prepare_mask_from_image(
+            ref_mask,
+            (dino_feat_map.shape[0], dino_feat_map.shape[1]),
+            dinov3_extractor.device,
+        )
+        dino_target_vec = _aggregate_target_vector(dino_feat_map, dino_mask, args.feat_aggregation)
+        if dino_target_vec is None:
+            print(f"Warning: Reference mask is empty for {obj_name} (DinoV3 features).")
+            return
+        dino_target_unit = _normalize_vector(dino_target_vec.unsqueeze(0))
     else:
-        target_embedding = target_feat.mean(0).unsqueeze(0)
-    
-    # Normalize target embedding
-    target_feat = target_embedding / target_embedding.norm(dim=-1, keepdim=True)
-    target_embedding = target_embedding.unsqueeze(0)
+        dino_target_unit = None
 
 
     print('======> Start Testing')
@@ -189,15 +300,17 @@ def persam(args, obj_name, images_path, masks_path, output_path):
 
         # Image feature encoding
         predictor.set_image(test_image)
-        test_feat = predictor.features.squeeze()
+        sam_test_feat = predictor.features.squeeze()
+        sam_sim = _compute_similarity(sam_target_unit, sam_test_feat)
 
-        # Enhanced cosine similarity computation
-        C, h, w = test_feat.shape
-        test_feat_norm = test_feat / (test_feat.norm(dim=0, keepdim=True) + 1e-8)  # Add epsilon for stability
-        test_feat_flat = test_feat_norm.reshape(C, h * w)
-        sim = target_feat @ test_feat_flat
-
-        sim = sim.reshape(1, 1, h, w)
+        if feature_encoder == 'dinov3':
+            dino_test_feat = dinov3_extractor(test_image)
+            dino_sim = _compute_similarity(dino_target_unit, dino_test_feat)
+            weight = max(0.0, min(1.0, args.dinov3_sim_weight))
+            sim = weight * dino_sim + (1 - weight) * sam_sim
+        else:
+            sim = sam_sim
+        sim = sim * args.dinov3_sim_gain
         # Better interpolation with align_corners
         sim = F.interpolate(sim, scale_factor=4, mode="bilinear", align_corners=False)
         sim = predictor.model.postprocess_masks(
@@ -230,7 +343,7 @@ def persam(args, obj_name, images_path, masks_path, output_path):
             point_labels=topk_label, 
             multimask_output=False,
             attn_sim=attn_sim,  # Target-guided Attention
-            target_embedding=target_embedding  # Target-semantic Prompting
+            target_embedding=sam_target_embedding  # Target-semantic Prompting
         )
         best_idx = 0
 
@@ -273,9 +386,15 @@ def persam(args, obj_name, images_path, masks_path, output_path):
         # Save results
         if masks is not None and masks.shape[0] > 0:
             # Save visualization
+            refined_mask = _smooth_mask(
+                masks[best_idx],
+                method=args.mask_smoothing,
+                kernel=args.mask_smoothing_kernel,
+                sigma=args.mask_smoothing_sigma,
+            )
             plt.figure(figsize=(10, 10))
             plt.imshow(test_image)
-            show_mask(masks[best_idx], plt.gca())
+            show_mask(refined_mask, plt.gca())
             show_points(topk_xy, topk_label, plt.gca())
             plt.title(f"Mask {best_idx} (Score: {scores[best_idx]:.3f})", fontsize=18)
             plt.axis('off')
@@ -284,7 +403,7 @@ def persam(args, obj_name, images_path, masks_path, output_path):
             plt.close()
 
             # Save mask
-            final_mask = masks[best_idx]
+            final_mask = refined_mask
             mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
             mask_colors[final_mask, :] = np.array([[0, 0, 128]])
             mask_output_path = os.path.join(output_path, test_idx + '.png')
