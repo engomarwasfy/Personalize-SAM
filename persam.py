@@ -29,6 +29,7 @@ warnings.filterwarnings('ignore')
 from show import *
 from per_segment_anything import sam_model_registry, SamPredictor
 from dinov3_encoder import DinoV3FeatureExtractor
+from eval_miou import evaluate as evaluate_miou
 
 # Global SAM instance to avoid reloading for each object
 sam = None
@@ -211,6 +212,8 @@ def main():
             except Exception as e:
                 print(f"Error processing {obj_name}: {str(e)}")
                 continue
+    print("\nEvaluate...\n")
+    evaluate_miou(output_path, masks_path, args.ref_idx)
 
 
 def persam(args, obj_name, images_path, masks_path, output_path):

@@ -19,12 +19,10 @@ def get_arguments():
     return args
 
 
-def main():
+def evaluate(pred_path, gt_path, ref_idx):
+    print("Evaluate:", {"pred_path": pred_path, "gt_path": gt_path, "ref_idx": ref_idx}, "\n")
 
-    args = get_arguments()
-    print("Args:", args, "\n"), 
-
-    class_names = sorted(os.listdir(args.gt_path))
+    class_names = sorted(os.listdir(gt_path))
     class_names = [class_name for class_name in class_names if ".DS" not in class_name]
     class_names.sort()
 
@@ -32,8 +30,8 @@ def main():
     count = 0
     for class_name in class_names:
         count += 1
-        gt_path_class = os.path.join(args.gt_path, class_name)
-        pred_path_class = os.path.join("./outputs/" + args.pred_path, class_name)
+        gt_path_class = os.path.join(gt_path, class_name)
+        pred_path_class = os.path.join(pred_path, class_name)
 
         gt_images = [str(img_path) for img_path in sorted(Path(gt_path_class).rglob("*.png"))]
         pred_images = [str(img_path) for img_path in sorted(Path(pred_path_class).rglob("*.png"))]
@@ -43,7 +41,7 @@ def main():
         target_meter = AverageMeter()
 
         for i, (gt_img, pred_img) in enumerate(zip(gt_images, pred_images)): 
-            if args.ref_idx in gt_img:
+            if ref_idx in gt_img:
                 continue
 
             gt_img = cv2.imread(gt_img)
@@ -65,8 +63,18 @@ def main():
         mIoU += iou_class
         mAcc += accuracy_class
 
-    print("\nmIoU: %.2f" %(100 * mIoU / count))
-    print("mAcc: %.2f\n" %(100 * mAcc / count))
+    if count > 0:
+        print("\nmIoU: %.2f" %(100 * mIoU / count))
+        print("mAcc: %.2f\n" %(100 * mAcc / count))
+    else:
+        print("No classes found for evaluation.")
+
+
+def main():
+
+    args = get_arguments()
+    outputs_pred_path = os.path.join("./outputs", args.pred_path)
+    evaluate(outputs_pred_path, args.gt_path, args.ref_idx)
 
 
 class AverageMeter(object):
