@@ -1,7 +1,22 @@
-matplotlib
-tqdm
-os
-numpy
-warnings
-argparse
-opencv-python
+# ==============================================
+# Requirements for Python 3.8 environment
+# Latest compatible stable releases (as of 2025)
+# ==============================================
+
+matplotlib==3.7.3
+numpy<=1.23.5
+tqdm==4.66.5
+opencv-python==4.8.1.78
+timm==0.9.12
+pandas==2.0.3
+scipy==1.10.1
+scikit-image==0.21.0
+
+
+# ----------------------------------------------
+# Built-in modules — DO NOT install via pip
+# (They are part of Python standard library)
+# os
+# warnings
+# argparse
+# ----------------------------------------------
