@@ -9,3 +9,19 @@ python persam.py \
   --mask_smoothing gaussian \
   --mask_smoothing_kernel 7 \
   --mask_smoothing_sigma 1.5
+
+
+
+python persam_f.py --data ./data --outdir persam_f --ref_idx 00 \
+  --train_resolution 256 --topk 1 --box_padding 0.03 \
+  --mask_smoothing gaussian --mask_smoothing_kernel 5 --mask_smoothing_sigma 0.8
+
+
+python p2sam.py \
+  --data data/perseg \
+  --outdir results/p2sam/perseg \
+  --ckpt sam_vit_h_4b8939.pth \
+  --sam-type vit_h \
+  --guided-attn \
+  --max-num-pos 5 \
+  --min-num-pos 1 \

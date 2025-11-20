@@ -30,6 +30,19 @@ def get_arguments():
     parser.add_argument('--train_epoch', type=int, default=1000)
     parser.add_argument('--log_epoch', type=int, default=200)
     parser.add_argument('--ref_idx', type=str, default='00')
+    parser.add_argument('--train_resolution', type=int, default=384,
+                        help='Square resolution used for optimizing mask weights.')
+    parser.add_argument('--topk', type=int, default=3,
+                        help='Top-k similarity points fed into SAM.')
+    parser.add_argument('--box_padding', type=float, default=0.08,
+                        help='Fractional padding applied to refinement boxes.')
+    parser.add_argument('--mask_smoothing', type=str, default='none',
+                        choices=['none', 'gaussian', 'morph_close'],
+                        help='Optional post-processing for final masks.')
+    parser.add_argument('--mask_smoothing_kernel', type=int, default=5,
+                        help='Kernel size for smoothing filters (odd integer).')
+    parser.add_argument('--mask_smoothing_sigma', type=float, default=1.0,
+                        help='Sigma for gaussian smoothing.')
 
     args = parser.parse_args()
     return args
@@ -57,6 +70,39 @@ def main():
 sam = None
 
 
+def _expand_box(box, image_shape, padding_ratio):
+    """Expand a box by a padding ratio while staying inside the image."""
+    if padding_ratio <= 0:
+        return box
+    h, w = image_shape[:2]
+    x_min, y_min, x_max, y_max = box
+    pad_x = int((x_max - x_min) * padding_ratio)
+    pad_y = int((y_max - y_min) * padding_ratio)
+    x_min = max(0, x_min - pad_x)
+    x_max = min(w - 1, x_max + pad_x)
+    y_min = max(0, y_min - pad_y)
+    y_max = min(h - 1, y_max + pad_y)
+    return np.array([x_min, y_min, x_max, y_max])
+
+
+def _smooth_mask(mask_array, method='none', kernel=5, sigma=1.0):
+    """Simple mask smoothing helpers to clean edges."""
+    if method == 'none':
+        return mask_array
+    kernel = max(1, kernel)
+    if kernel % 2 == 0:
+        kernel += 1
+    if method == 'gaussian':
+        mask_float = cv2.GaussianBlur(mask_array.astype(np.float32), (kernel, kernel), sigma)
+        return mask_float > 0.5
+    if method == 'morph_close':
+        struct = np.ones((kernel, kernel), np.uint8)
+        mask_uint8 = mask_array.astype(np.uint8)
+        closed = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, struct)
+        return closed > 0
+    return mask_array
+
+
 def persam_f(args, obj_name, images_path, masks_path, output_path):
     print("\n------------> Segment " + obj_name)
 
@@ -75,7 +121,7 @@ def persam_f(args, obj_name, images_path, masks_path, output_path):
     ref_mask = cv2.imread(ref_mask_path)
     ref_mask = cv2.cvtColor(ref_mask, cv2.COLOR_BGR2RGB)
 
-    resolution = [256, 256]
+    resolution = [args.train_resolution, args.train_resolution]
 
     gt_mask = torch.tensor(ref_mask)[None, :, :, 0] > 0
     gt_mask = TVF.resize(gt_mask.float(), resolution)
@@ -126,7 +172,7 @@ def persam_f(args, obj_name, images_path, masks_path, output_path):
         original_size=predictor.original_size).squeeze()
 
     # Positive location prior
-    topk_xy, topk_label = point_selection(sim, topk=1)
+    topk_xy, topk_label = point_selection(sim, topk=args.topk)
 
     print('======> Start Training')
     # Learnable mask weights
@@ -197,7 +243,7 @@ def persam_f(args, obj_name, images_path, masks_path, output_path):
             original_size=predictor.original_size).squeeze()
 
         # Positive location prior
-        topk_xy, topk_label = point_selection(sim, topk=1)
+        topk_xy, topk_label = point_selection(sim, topk=args.topk)
 
         # First-step prediction
         masks, scores, logits, logits_high = predictor.predict(
@@ -214,12 +260,15 @@ def persam_f(args, obj_name, images_path, masks_path, output_path):
         logit = logits.sum(0)
 
         # Cascaded Post-refinement-1
+        if not np.any(mask):
+            mask = (logit_high > 0).detach().cpu().numpy()
         y, x = np.nonzero(mask)
         x_min = x.min()
         x_max = x.max()
         y_min = y.min()
         y_max = y.max()
         input_box = np.array([x_min, y_min, x_max, y_max])
+        input_box = _expand_box(input_box, mask.shape, args.box_padding)
         masks, scores, logits, _ = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
@@ -229,12 +278,14 @@ def persam_f(args, obj_name, images_path, masks_path, output_path):
         best_idx = np.argmax(scores)
 
         # Cascaded Post-refinement-2
-        y, x = np.nonzero(masks[best_idx])
+        refined_mask = masks[best_idx]
+        y, x = np.nonzero(refined_mask)
         x_min = x.min()
         x_max = x.max()
         y_min = y.min()
         y_max = y.max()
         input_box = np.array([x_min, y_min, x_max, y_max])
+        input_box = _expand_box(input_box, refined_mask.shape, args.box_padding / 2)
         masks, scores, logits, _ = predictor.predict(
             point_coords=topk_xy,
             point_labels=topk_label,
@@ -255,6 +306,12 @@ def persam_f(args, obj_name, images_path, masks_path, output_path):
             plt.savefig(outfile, format='jpg')
 
         final_mask = masks[best_idx]
+        final_mask = _smooth_mask(
+            final_mask,
+            method=args.mask_smoothing,
+            kernel=args.mask_smoothing_kernel,
+            sigma=args.mask_smoothing_sigma
+        )
         mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
         mask_colors[final_mask, :] = np.array([[0, 0, 128]])
         mask_output_path = os.path.join(output_path, test_idx + '.png')
@@ -270,6 +327,8 @@ class Mask_Weights(nn.Module):
 def point_selection(mask_sim, topk=1):
     # Top-1 point selection
     w, h = mask_sim.shape
+    total = w * h
+    topk = max(1, min(topk, total))
     topk_xy = mask_sim.flatten(0).topk(topk)[1]
     topk_x = (topk_xy // h).unsqueeze(0)
     topk_y = (topk_xy - topk_x * h)
