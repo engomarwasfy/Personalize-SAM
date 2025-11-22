@@ -17,11 +17,6 @@ python persam_f.py --data ./data --outdir persam_f --ref_idx 00 \
   --mask_smoothing gaussian --mask_smoothing_kernel 5 --mask_smoothing_sigma 0.8
 
 
-python p2sam.py \
-  --data data/perseg \
-  --outdir results/p2sam/perseg \
-  --ckpt sam_vit_h_4b8939.pth \
-  --sam-type vit_h \
-  --guided-attn \
-  --max-num-pos 5 \
-  --min-num-pos 1 \
+/PycharmProjects/Personalize-SAM/sam3/sam3/sam/rope.py", line 13, in <module>
+    from einops import rearrange, repeat
+ModuleNotFoundError: No module named 'einops'
