@@ -3,6 +3,7 @@ from PIL import Image
 from os import path
 import numpy as np
 import torch
+import cv2
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from per_segment_anything import SamPredictor, sam_model_registry
@@ -145,6 +146,14 @@ def main(args):
                 x_max = x.max()
                 y_min = y.min()
                 y_max = y.max()
+                # light padding to reduce over-tight boxes
+                padding_x = int(max(1, (x_max - x_min) * args.box_padding))
+                padding_y = int(max(1, (y_max - y_min) * args.box_padding))
+                img_h, img_w = current_img.shape[:2]
+                x_min = max(0, x_min - padding_x)
+                x_max = min(img_w - 1, x_max + padding_x)
+                y_min = max(0, y_min - padding_y)
+                y_max = min(img_h - 1, y_max + padding_y)
                 input_box = np.array([x_min, y_min, x_max, y_max])
                 masks, scores, logits, _ = predictor.predict(
                     point_coords=topk_xy,
@@ -156,7 +165,11 @@ def main(args):
 
                 ic_index = np.argmax(scores)
 
-                concat_mask = np.concatenate((concat_mask, masks[ic_index].reshape(1, masks.shape[1], masks.shape[2])), axis=0)
+                # optional mask smoothing for cleaner edges
+                refined_mask = masks[ic_index]
+                if args.mask_smoothing == 'gaussian':
+                    refined_mask = _smooth_mask(refined_mask, kernel=args.mask_smoothing_kernel, sigma=args.mask_smoothing_sigma)
+                concat_mask = np.concatenate((concat_mask, refined_mask.reshape(1, masks.shape[1], masks.shape[2])), axis=0)
                 
             current_mask_pred = np.argmax(concat_mask, axis=0).astype(np.uint8)
             output = Image.fromarray(current_mask_pred)
@@ -195,6 +208,15 @@ def point_selection(mask_sim, topk=1):
     topk_xy = topk_xy.cpu().numpy()
     return topk_xy, topk_label
 
+def _smooth_mask(mask_array, kernel=5, sigma=1.0):
+    """Simple Gaussian smoothing for binary masks."""
+    kernel = max(1, kernel)
+    if kernel % 2 == 0:
+        kernel += 1
+    mask_float = mask_array.astype(np.float32)
+    smoothed = cv2.GaussianBlur(mask_float, (kernel, kernel), sigma)
+    return (smoothed > 0.5).astype(mask_array.dtype)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_path", type=str, help="output path", required=True)
@@ -207,6 +229,10 @@ if __name__ == '__main__':
     parser.add_argument("--box_prompt", action="store_true", help="whether use box prompt")
     parser.add_argument("--large", action="store_true", help="whether choose largest mask for prompting after stage 1")
     parser.add_argument("--center", action="store_true", help="whether prompt with center")
+    parser.add_argument("--box_padding", type=float, help="padding ratio for refinement box", default=0.05)
+    parser.add_argument("--mask_smoothing", type=str, default='none', choices=['none', 'gaussian'], help="optional mask smoothing")
+    parser.add_argument("--mask_smoothing_kernel", type=int, default=5, help="kernel size for smoothing")
+    parser.add_argument("--mask_smoothing_sigma", type=float, default=1.0, help="sigma for smoothing")
     parser.set_defaults(box_prompt=True)
     parser.set_defaults(large=True)
     parser.set_defaults(center=True)
