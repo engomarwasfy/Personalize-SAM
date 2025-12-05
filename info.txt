@@ -17,6 +17,28 @@ python persam_f.py --data ./data --outdir persam_f --ref_idx 00 \
   --mask_smoothing gaussian --mask_smoothing_kernel 5 --mask_smoothing_sigma 0.8
 
 
-/PycharmProjects/Personalize-SAM/sam3/sam3/sam/rope.py", line 13, in <module>
-    from einops import rearrange, repeat
-ModuleNotFoundError: No module named 'einops'
+python text_prompt_seg_sam3.py \
+  --data ./data \
+  --outdir outputs/text_sam3 \
+  --sam3-ckpt sam3.pt
+
+
+python text_prompt_seg_sam3_davis.py   --davis-path ./DAVIS/2017   --split val   --outdir outputs/text_sam3_davis_caption   --prompt-source caption   --caption-model Salesforce/blip-image-captioning-base   --caption-device cuda   # or cpu if no GPU
+
+
+
+python persam_video.py --output_path ./outputs/persam_video_tweak --davis_path ./DAVIS/2017 --dataset_set 2017 --topk 2 --exp 215 --threshold 10 --box_padding 0.02 --mask_smoothing none
+
+
+
+
+
+
+
+/home/wasfy/anaconda3/envs/p2sam/bin/python persam_video.py \
+  --output_path ./results/persam_enhanced_tuned_neg0 \
+  --davis_path ./DAVIS/2017 \
+  --dataset_set 2017 \
+  --memory_size 5 \
+  --neg_topk 0 \
+  --overwrite
