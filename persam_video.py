@@ -35,7 +35,7 @@ def main(args):
         os.makedirs(args.output_path, exist_ok=True)
         L = os.listdir(args.output_path)
         print("Processing Video", name, "....")
-        if name in L:
+        if name in L and not args.overwrite:
             print("File", name, "exists in", args.output_path, ", skip...")
             continue
         num_obj = len(info['labels'][0])
@@ -48,6 +48,9 @@ def main(args):
         first_frame_mask = msk[:, 0] * args.exp 
         
         fore_feat_list = []
+        # Memory banks for each object (temporal consistency)
+        memory_banks = [[] for _ in range(num_obj)]
+        
         # Foreground features
         input_boxes = []
         for k in range(msk[:, 0].shape[0]):
@@ -76,6 +79,10 @@ def main(args):
             fore_feat = (fore_feat_max / 2 + fore_feat_mean / 2).unsqueeze(0)
             fore_feat = fore_feat / fore_feat.norm(dim=-1, keepdim=True)
             fore_feat_list.append(fore_feat)
+            
+            # Initialize memory bank with first frame feature
+            if args.memory_size > 0:
+                memory_banks[obj].append(fore_feat.clone())
 
         for i in range (1, frame_num):
             current_img = rgb[0, i] 
@@ -90,8 +97,16 @@ def main(args):
             
             concat_mask = np.zeros((1, first_frame_mask.shape[1], first_frame_mask.shape[2]), dtype=np.uint8)
             for j in range(min(len(fore_feat_list), len(input_boxes))):
+                # Get base foreground feature (keep original unchanged)
+                fore_feat_original = fore_feat_list[j]
+                
+                # Optionally blend with memory bank for temporal consistency
+                if args.memory_size > 0 and len(memory_banks[j]) > 0:
+                    fore_feat = aggregate_memory(fore_feat_original, memory_banks[j], decay=args.memory_decay)
+                else:
+                    fore_feat = fore_feat_original
+                
                 # Cosine similarity
-                fore_feat = fore_feat_list[j]
                 sim = fore_feat @ test_feat  # 1, h*w
                 sim = sim.reshape(1, 1, htest, wtest)
                 sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
@@ -101,12 +116,17 @@ def main(args):
                                 input_size=predictor.input_size,
                                 original_size=predictor.original_size).squeeze()
 
-                # Top-k point selection
+                # Top-k point selection (positive points)
                 w, h = mask_sim.shape
-
                 topk_xy_i, topk_label_i = point_selection(mask_sim, topk=args.topk)
                 topk_xy = topk_xy_i
                 topk_label = topk_label_i
+                
+                # Negative point selection for improved precision
+                if args.neg_topk > 0:
+                    neg_xy, neg_label = negative_point_selection(mask_sim, topk=args.neg_topk)
+                    topk_xy = np.concatenate([topk_xy, neg_xy], axis=0)
+                    topk_label = np.concatenate([topk_label, neg_label], axis=0)
 
                 if args.center:
                     topk_label = np.concatenate([topk_label, [1]], axis=0)
@@ -142,31 +162,46 @@ def main(args):
 
                 # box refine
                 y, x = np.nonzero(masks[ic_index])
-                x_min = x.min()
-                x_max = x.max()
-                y_min = y.min()
-                y_max = y.max()
-                # light padding to reduce over-tight boxes
-                padding_x = int(max(1, (x_max - x_min) * args.box_padding))
-                padding_y = int(max(1, (y_max - y_min) * args.box_padding))
-                img_h, img_w = current_img.shape[:2]
-                x_min = max(0, x_min - padding_x)
-                x_max = min(img_w - 1, x_max + padding_x)
-                y_min = max(0, y_min - padding_y)
-                y_max = min(img_h - 1, y_max + padding_y)
-                input_box = np.array([x_min, y_min, x_max, y_max])
-                masks, scores, logits, _ = predictor.predict(
-                    point_coords=topk_xy,
-                    point_labels=topk_label,
-                    box=input_box[None, :],
-                    mask_input=logits[ic_index: ic_index + 1, :, :], 
-                    multimask_output=True,
-                    return_logits=True)
+                if len(x) == 0 or len(y) == 0:
+                    # Empty mask, skip refinement
+                    refined_mask = masks[ic_index]
+                else:
+                    x_min = x.min()
+                    x_max = x.max()
+                    y_min = y.min()
+                    y_max = y.max()
+                    # light padding to reduce over-tight boxes
+                    padding_x = int(max(1, (x_max - x_min) * args.box_padding))
+                    padding_y = int(max(1, (y_max - y_min) * args.box_padding))
+                    img_h, img_w = current_img.shape[:2]
+                    x_min = max(0, x_min - padding_x)
+                    x_max = min(img_w - 1, x_max + padding_x)
+                    y_min = max(0, y_min - padding_y)
+                    y_max = min(img_h - 1, y_max + padding_y)
+                    input_box = np.array([x_min, y_min, x_max, y_max])
+                    masks, scores, logits, _ = predictor.predict(
+                        point_coords=topk_xy,
+                        point_labels=topk_label,
+                        box=input_box[None, :],
+                        mask_input=logits[ic_index: ic_index + 1, :, :], 
+                        multimask_output=True,
+                        return_logits=True)
 
-                ic_index = np.argmax(scores)
+                    ic_index = np.argmax(scores)
+                    refined_mask = masks[ic_index]
+                    
+                    # Update memory bank only for high-confidence predictions
+                    if args.memory_size > 0 and scores[ic_index] > 0.7:
+                        current_feat = extract_foreground_features(
+                            refined_mask, test_feat.reshape(C, htest, wtest),
+                            (htest, wtest), predictor.original_size
+                        )
+                        if current_feat is not None:
+                            memory_banks[j].append(current_feat)
+                            if len(memory_banks[j]) > args.memory_size:
+                                memory_banks[j].pop(0)
 
                 # optional mask smoothing for cleaner edges
-                refined_mask = masks[ic_index]
                 if args.mask_smoothing == 'gaussian':
                     refined_mask = _smooth_mask(refined_mask, kernel=args.mask_smoothing_kernel, sigma=args.mask_smoothing_sigma)
                 concat_mask = np.concatenate((concat_mask, refined_mask.reshape(1, masks.shape[1], masks.shape[2])), axis=0)
@@ -199,14 +234,77 @@ def get_box_prompt(img, threshold):
     return np.array([[(cmin + cmax) // 2, (rmin + rmax) // 2]]), np.array([cmin,rmin,cmax,rmax]) # x1,y1,x2,y2
 
 def point_selection(mask_sim, topk=1):
+    """Select top-k positive points from highest similarity regions."""
     w, h = mask_sim.shape
     topk_xy = mask_sim.flatten(0).topk(topk)[1]
-    topk_x = (topk_xy // h).unsqueeze(0)
+    topk_x = torch.div(topk_xy, h, rounding_mode='trunc').unsqueeze(0)
     topk_y = (topk_xy - topk_x * h)
     topk_xy = torch.cat((topk_y, topk_x), dim=0).permute(1, 0)
     topk_label = np.array([1] * topk)
     topk_xy = topk_xy.cpu().numpy()
     return topk_xy, topk_label
+
+def negative_point_selection(mask_sim, topk=1):
+    """Select top-k negative points from lowest similarity regions."""
+    w, h = mask_sim.shape
+    # Get bottom-k (lowest similarity) points
+    neg_topk_xy = (-mask_sim).flatten(0).topk(topk)[1]
+    neg_topk_x = torch.div(neg_topk_xy, h, rounding_mode='trunc').unsqueeze(0)
+    neg_topk_y = (neg_topk_xy - neg_topk_x * h)
+    neg_topk_xy = torch.cat((neg_topk_y, neg_topk_x), dim=0).permute(1, 0)
+    neg_topk_label = np.array([0] * topk)  # 0 = negative label
+    neg_topk_xy = neg_topk_xy.cpu().numpy()
+    return neg_topk_xy, neg_topk_label
+
+def aggregate_memory(current_feat, memory_bank, decay=0.9):
+    """Aggregate current feature with memory bank using exponential decay weighting.
+    
+    CONSERVATIVE: Original reference feature dominates (90%), memory provides
+    only slight temporal smoothing (10%) to avoid feature drift.
+    """
+    if len(memory_bank) == 0:
+        return current_feat
+    
+    # Stack all memory features
+    memory_feats = torch.cat(memory_bank, dim=0)  # (N, C)
+    
+    # Create exponential decay weights (most recent = highest weight)
+    n = len(memory_bank)
+    weights = torch.tensor([decay ** (n - 1 - i) for i in range(n)], device=memory_feats.device)
+    weights = weights / weights.sum()  # Normalize
+    
+    # Weighted average of memory features
+    memory_agg = (weights.unsqueeze(1) * memory_feats).sum(dim=0, keepdim=True)
+    
+    # CONSERVATIVE: Keep original reference dominant (90%), memory is just a hint (10%)
+    combined = 0.9 * current_feat + 0.1 * memory_agg
+    combined = combined / combined.norm(dim=-1, keepdim=True)
+    
+    return combined
+
+def extract_foreground_features(mask, test_feat, feat_size, original_size):
+    """Extract foreground features from current frame based on predicted mask."""
+    htest, wtest = feat_size
+    C = test_feat.shape[0]
+    
+    # Resize mask to feature size
+    mask_tensor = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).cuda()
+    mask_resized = F.interpolate(mask_tensor, size=(htest, wtest), mode="bilinear")
+    mask_resized = mask_resized.squeeze() > 0.5
+    
+    # Extract features from masked region
+    feat_permuted = test_feat.permute(1, 2, 0)  # (H, W, C)
+    fore_feat = feat_permuted[mask_resized]
+    
+    if fore_feat.shape[0] == 0:
+        return None
+    
+    fore_feat_mean = fore_feat.mean(0)
+    fore_feat_max = torch.max(fore_feat, dim=0)[0]
+    fore_feat = (fore_feat_max / 2 + fore_feat_mean / 2).unsqueeze(0)
+    fore_feat = fore_feat / fore_feat.norm(dim=-1, keepdim=True)
+    
+    return fore_feat
 
 def _smooth_mask(mask_array, kernel=5, sigma=1.0):
     """Simple Gaussian smoothing for binary masks."""
@@ -233,6 +331,20 @@ if __name__ == '__main__':
     parser.add_argument("--mask_smoothing", type=str, default='none', choices=['none', 'gaussian'], help="optional mask smoothing")
     parser.add_argument("--mask_smoothing_kernel", type=int, default=5, help="kernel size for smoothing")
     parser.add_argument("--mask_smoothing_sigma", type=float, default=1.0, help="sigma for smoothing")
+    parser.add_argument("--overwrite", action="store_true", help="overwrite existing results")
+    
+    # Memory Bank arguments
+    parser.add_argument("--memory_size", type=int, default=5, help="number of frames to keep in memory bank (0 to disable)")
+    parser.add_argument("--memory_decay", type=float, default=0.9, help="exponential decay factor for memory weighting")
+    
+    # Negative Point Prompting arguments
+    parser.add_argument("--neg_topk", type=int, default=1, help="number of negative points to select (0 to disable)")
+    
+    # Adaptive Feature Updating arguments
+    parser.add_argument("--adaptive_update", action="store_true", help="enable adaptive feature updating")
+    parser.add_argument("--confidence_threshold", type=float, default=0.85, help="confidence threshold for feature updating")
+    parser.add_argument("--update_alpha", type=float, default=0.1, help="blending weight for new features")
+    
     parser.set_defaults(box_prompt=True)
     parser.set_defaults(large=True)
     parser.set_defaults(center=True)

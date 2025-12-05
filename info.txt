@@ -30,15 +30,15 @@ python text_prompt_seg_sam3_davis.py   --davis-path ./DAVIS/2017   --split val  
 python persam_video.py --output_path ./outputs/persam_video_tweak --davis_path ./DAVIS/2017 --dataset_set 2017 --topk 2 --exp 215 --threshold 10 --box_padding 0.02 --mask_smoothing none
 
 
-
-
-
-
-
 /home/wasfy/anaconda3/envs/p2sam/bin/python persam_video.py \
-  --output_path ./results/persam_enhanced_tuned_neg0 \
+  --output_path ./results/persam_fixed_v2 \
   --davis_path ./DAVIS/2017 \
   --dataset_set 2017 \
-  --memory_size 5 \
-  --neg_topk 0 \
+  --memory_size 3 \
+  --neg_topk 1 \
   --overwrite
+
+
+
+
+
